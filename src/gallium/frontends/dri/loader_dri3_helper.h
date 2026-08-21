@@ -78,6 +78,7 @@ struct loader_dri3_buffer {
    uint32_t     flags;
    uint32_t     width, height;
    uint64_t     last_swap;
+   uint32_t     ardesk_token;
 };
 
 
@@ -176,6 +177,8 @@ struct loader_dri3_drawable {
    xcb_present_complete_mode_t last_present_mode;
 
    bool is_protected_content;
+   bool ardesk;
+   int ardesk_sock;
 
    /* Currently protects the following fields:
     * event_cnd, has_event_waiter,

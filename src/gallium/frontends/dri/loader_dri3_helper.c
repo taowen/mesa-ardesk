@@ -23,6 +23,7 @@
 
 #include <fcntl.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 #include <string.h>
 
@@ -43,6 +44,7 @@
 #include "drm-uapi/drm_fourcc.h"
 #include "dri_screen.h"
 #include "dri_util.h"
+#include "loader_ardesk_present.h"
 
 /**
  * A cached blit context.
@@ -343,8 +345,12 @@ dri3_free_render_buffer(struct loader_dri3_drawable *draw,
 
    if (buffer->own_pixmap)
       xcb_free_pixmap(draw->conn, buffer->pixmap);
-   xcb_sync_destroy_fence(draw->conn, buffer->sync_fence);
-   xshmfence_unmap_shm(buffer->shm_fence);
+   if (buffer->sync_fence)
+      xcb_sync_destroy_fence(draw->conn, buffer->sync_fence);
+   if (buffer->shm_fence)
+      xshmfence_unmap_shm(buffer->shm_fence);
+   if (buffer->ardesk_token)
+      loader_ardesk_release(draw->ardesk_sock, buffer->ardesk_token);
    dri2_destroy_image(buffer->image);
    if (buffer->linear_buffer)
       dri2_destroy_image(buffer->linear_buffer);
@@ -415,6 +421,10 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    draw->adaptive_sync = false;
    draw->adaptive_sync_active = false;
    draw->block_on_depleted_buffers = false;
+   draw->ardesk_sock = -1;
+   if (loader_ardesk_available())
+      draw->ardesk_sock = loader_ardesk_connect();
+   draw->ardesk = draw->ardesk_sock >= 0;
 
    draw->cur_blit_source = -1;
    draw->back_format = DRM_FORMAT_INVALID;
@@ -438,12 +448,14 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
       draw->block_on_depleted_buffers = block_on_depleted_buffers;
    }
 
-   if (!draw->adaptive_sync)
+   if (!draw->adaptive_sync && !draw->ardesk)
       set_adaptive_sync_property(conn, draw->drawable, false);
 
    draw->swap_interval = dri_get_initial_swap_interval(draw->dri_screen_render_gpu);
 
    dri3_update_max_num_back(draw);
+   if (draw->ardesk)
+      draw->max_num_back = 2;
 
    /* Create a new drawable */
    draw->dri_drawable = dri_create_drawable(dri_screen_render_gpu, dri_config,
@@ -616,6 +628,18 @@ loader_dri3_wait_for_msc(struct loader_dri3_drawable *draw,
                          int64_t divisor, int64_t remainder,
                          int64_t *ust, int64_t *msc, int64_t *sbc)
 {
+   if (draw->ardesk) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      *ust = (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+      *msc = draw->msc;
+      *sbc = draw->recv_sbc;
+      (void)target_msc;
+      (void)divisor;
+      (void)remainder;
+      return true;
+   }
+
    xcb_void_cookie_t cookie = xcb_present_notify_msc(draw->conn,
                                                      draw->drawable,
                                                      draw->eid,
@@ -660,6 +684,17 @@ loader_dri3_wait_for_sbc(struct loader_dri3_drawable *draw,
     *      completed."
     */
    mtx_lock(&draw->mtx);
+   if (draw->ardesk) {
+      if (!target_sbc)
+         target_sbc = draw->send_sbc;
+      if (draw->recv_sbc < target_sbc)
+         draw->recv_sbc = target_sbc;
+      *ust = draw->ust;
+      *msc = draw->msc;
+      *sbc = draw->recv_sbc;
+      mtx_unlock(&draw->mtx);
+      return 1;
+   }
    if (!target_sbc)
       target_sbc = draw->send_sbc;
 
@@ -1084,6 +1119,33 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
 
    dri3_flush_present_events(draw);
 
+   if (draw->ardesk && draw->type == LOADER_DRI3_DRAWABLE_WINDOW) {
+      int b;
+
+      if (loader_ardesk_present(draw->ardesk_sock, draw->window,
+                                draw->width, draw->height,
+                                back->ardesk_token) != 0) {
+         mesa_loge("ardesk: present token=%u failed", back->ardesk_token);
+         mtx_unlock(&draw->mtx);
+         return ret;
+      }
+      ++draw->send_sbc;
+      draw->recv_sbc = back->last_swap = draw->send_sbc;
+      draw->msc++;
+      back->busy = 1;
+      for (b = 0; b < LOADER_DRI3_MAX_BACK; b++) {
+         if (draw->buffers[b] && draw->buffers[b] != back)
+            draw->buffers[b]->busy = 0;
+      }
+      dri3_fence_set(back);
+      ret = (int64_t)draw->send_sbc;
+      if (draw->stamp)
+         ++(*draw->stamp);
+      mtx_unlock(&draw->mtx);
+      dri_invalidate_drawable(draw->dri_drawable);
+      return ret;
+   }
+
    if (draw->type == LOADER_DRI3_DRAWABLE_WINDOW) {
       dri3_fence_reset(draw->conn, back);
 
@@ -1413,9 +1475,96 @@ has_supported_modifier(struct loader_dri3_drawable *draw, unsigned int format,
  * Allocate an xshmfence for synchronization
  */
 static struct loader_dri3_buffer *
+dri3_alloc_ardesk_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
+                         int width, int height)
+{
+   struct loader_dri3_buffer *buffer;
+   uint32_t token = 0, pitch = 0, offset = 0, got_fourcc = 0;
+   int fd = -1, fence_fd;
+   int stride, import_fd;
+   uint64_t modifier;
+   unsigned error = 0;
+
+   (void)fourcc;
+   if (width <= 0 || height <= 0 || draw->ardesk_sock < 0 || !draw->window)
+      return NULL;
+
+   buffer = calloc(1, sizeof(*buffer));
+   if (!buffer)
+      return NULL;
+
+   if (loader_ardesk_alloc(draw->ardesk_sock, draw->window,
+                           (uint32_t)width, (uint32_t)height, 0,
+                           &token, &fd, &pitch, &offset, &got_fourcc) != 0) {
+      mesa_loge("ardesk: AHB alloc failed %dx%d", width, height);
+      free(buffer);
+      return NULL;
+   }
+
+   fence_fd = xshmfence_alloc_shm();
+   if (fence_fd < 0)
+      goto fail_fd;
+   buffer->shm_fence = xshmfence_map_shm(fence_fd);
+   close(fence_fd);
+   if (!buffer->shm_fence)
+      goto fail_fd;
+
+   stride = (int)pitch;
+   int off = (int)offset;
+   import_fd = fd;
+   modifier = DRM_FORMAT_MOD_LINEAR;
+   buffer->image = dri2_from_dma_bufs(draw->dri_screen_render_gpu,
+                                      width, height, got_fourcc, modifier,
+                                      &import_fd, 1, &stride, &off,
+                                      0, 0, 0, 0, 0, &error, buffer);
+   if (!buffer->image) {
+      import_fd = fd;
+      off = (int)offset;
+      modifier = DRM_FORMAT_MOD_INVALID;
+      buffer->image = dri2_from_dma_bufs(draw->dri_screen_render_gpu,
+                                         width, height, got_fourcc, modifier,
+                                         &import_fd, 1, &stride, &off,
+                                         0, 0, 0, 0, 0, &error, buffer);
+   }
+   close(fd);
+   fd = -1;
+   if (!buffer->image) {
+      mesa_loge("ardesk: dmabuf import failed fourcc=0x%x err=%u",
+                got_fourcc, error);
+      goto fail_fence;
+   }
+
+   buffer->ardesk_token = token;
+   buffer->own_pixmap = false;
+   buffer->pixmap = 0;
+   buffer->sync_fence = 0;
+   buffer->width = width;
+   buffer->height = height;
+   buffer->cpp = 4;
+   buffer->strides[0] = stride;
+   buffer->offsets[0] = (int)offset;
+   buffer->num_planes = 1;
+   buffer->modifier = modifier;
+   dri3_fence_set(buffer);
+   return buffer;
+
+fail_fence:
+   xshmfence_unmap_shm(buffer->shm_fence);
+fail_fd:
+   if (fd >= 0)
+      close(fd);
+   loader_ardesk_release(draw->ardesk_sock, token);
+   free(buffer);
+   return NULL;
+}
+
+static struct loader_dri3_buffer *
 dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
                          int width, int height, int depth)
 {
+   if (draw->ardesk)
+      return dri3_alloc_ardesk_buffer(draw, fourcc, width, height);
+
    struct loader_dri3_buffer *buffer;
    struct dri_image *pixmap_buffer = NULL, *linear_buffer_display_gpu = NULL;
    enum pipe_format format = loader_fourcc_to_pipe_format(fourcc);
@@ -1732,6 +1881,12 @@ dri3_detect_drawable_is_window(struct loader_dri3_drawable *draw)
 static bool
 dri3_setup_present_event(struct loader_dri3_drawable *draw)
 {
+   if (draw->ardesk) {
+      if (draw->type == LOADER_DRI3_DRAWABLE_UNKNOWN)
+         draw->type = LOADER_DRI3_DRAWABLE_WINDOW;
+      return true;
+   }
+
    /* No need to setup for pixmap drawable. */
    if (draw->type == LOADER_DRI3_DRAWABLE_PIXMAP ||
        draw->type == LOADER_DRI3_DRAWABLE_PBUFFER)
@@ -1806,6 +1961,22 @@ dri3_update_drawable(struct loader_dri3_drawable *draw)
          draw->window = root_win;
       else
          draw->window = draw->drawable;
+   } else if (draw->ardesk) {
+      xcb_get_geometry_cookie_t geom_cookie;
+      xcb_get_geometry_reply_t *geom_reply;
+
+      geom_cookie = xcb_get_geometry(draw->conn, draw->drawable);
+      geom_reply = xcb_get_geometry_reply(draw->conn, geom_cookie, NULL);
+      if (geom_reply) {
+         if (draw->width != geom_reply->width ||
+             draw->height != geom_reply->height) {
+            draw->width = geom_reply->width;
+            draw->height = geom_reply->height;
+            draw->vtable->set_drawable_size(draw, draw->width, draw->height);
+            dri_invalidate_drawable(draw->dri_drawable);
+         }
+         free(geom_reply);
+      }
    }
    dri3_flush_present_events(draw);
    mtx_unlock(&draw->mtx);
@@ -2209,8 +2380,8 @@ loader_dri3_get_buffers(struct dri_drawable *driDrawable,
       return false;
 
    dri3_update_max_num_back(draw);
-
-   /* Free no longer needed back buffers */
+   if (draw->ardesk)
+      draw->max_num_back = 2;
    for (buf_id = 0; buf_id < LOADER_DRI3_MAX_BACK; buf_id++) {
       int buffer_age;
 

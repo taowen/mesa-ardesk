@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "drm-uapi/drm_fourcc.h"
+#include "drm-uapi/drm.h"
 
 #include "freedreno_fence.h"
 #include "freedreno_perfetto.h"
@@ -683,6 +684,11 @@ fd_init_screen_caps(struct fd_screen *screen)
    caps->uma = true;
    caps->memobj = fd_device_version(screen->dev) >= FD_VERSION_MEMORY_FD;
    caps->native_fence_fd = fd_device_version(screen->dev) >= FD_VERSION_FENCE_FD;
+   /* kgsl is not a DRM node, so u_init_pipe_screen_caps leaves dmabuf=0.
+    * IOCTL_KGSL_GPUOBJ_IMPORT still accepts dma-buf/AHB fds.
+    */
+   if (!caps->dmabuf)
+      caps->dmabuf = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
    caps->fence_signal = screen->has_syncobj;
    caps->cull_distance = is_a6xx(screen);
    caps->shader_stencil_export = is_a6xx(screen);

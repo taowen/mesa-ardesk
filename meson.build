@@ -1103,7 +1103,7 @@ if with_platform_x11
     if with_glx_direct
       pre_args += '-DGLX_DIRECT_RENDERING'
     endif
-    if with_dri_platform == 'drm'
+    if with_dri_platform == 'drm' or with_dri_platform == 'pseudo-drm'
       pre_args += '-DGLX_USE_DRM'
     elif with_dri_platform == 'apple'
       pre_args += '-DGLX_USE_APPLEGL'

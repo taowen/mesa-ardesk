@@ -67,6 +67,7 @@
 #include "glxclient.h"
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -473,23 +474,33 @@ dri3_create_screen(int screen, struct glx_display * priv, bool driver_name_is_in
 
    psc->fd_display_gpu = -1;
 
+   bool kgsl = false;
    psc->fd_render_gpu = x11_dri3_open(c, RootWindow(priv->dpy, screen), None);
    if (psc->fd_render_gpu < 0) {
-      int conn_error = xcb_connection_has_error(c);
+      int kgsl_fd = open("/dev/kgsl-3d0", O_RDWR | O_CLOEXEC);
+      if (kgsl_fd < 0) {
+         int conn_error = xcb_connection_has_error(c);
 
-      glx_screen_cleanup(&psc->base);
-      free(psc);
-      InfoMessageF("screen %d does not appear to be DRI3 capable\n", screen);
+         glx_screen_cleanup(&psc->base);
+         free(psc);
+         InfoMessageF("screen %d does not appear to be DRI3 capable\n", screen);
 
-      if (conn_error)
-         ErrorMessageF("Connection closed during DRI3 initialization failure");
+         if (conn_error)
+            ErrorMessageF("Connection closed during DRI3 initialization failure");
 
-      return NULL;
+         return NULL;
+      }
+      psc->fd_render_gpu = kgsl_fd;
+      psc->fd_display_gpu = kgsl_fd;
+      kgsl = true;
+      InfoMessageF("screen %d using /dev/kgsl-3d0\n", screen);
    }
 
-   loader_get_user_preferred_fd(&psc->fd_render_gpu, &psc->fd_display_gpu);
+   if (!kgsl)
+      loader_get_user_preferred_fd(&psc->fd_render_gpu, &psc->fd_display_gpu);
 
-   driverName = loader_get_driver_for_fd(psc->fd_render_gpu);
+   driverName = kgsl ? strdup("kgsl") :
+      loader_get_driver_for_fd(psc->fd_render_gpu);
    if (!driverName) {
       ErrorMessageF("No driver found\n");
       goto handle_error;
@@ -551,7 +562,7 @@ dri3_create_screen(int screen, struct glx_display * priv, bool driver_name_is_in
    psc->base.can_EXT_texture_from_pixmap = psc->fd_render_gpu == psc->fd_display_gpu;
    psp->copySubBuffer = dri3_copy_sub_buffer;
 
-   InfoMessageF("Using DRI3 for screen %d\n", screen);
+   InfoMessageF("Using DRI3%s for screen %d\n", kgsl ? " kgsl" : "", screen);
 
    psc->prefer_back_buffer_reuse = 1;
    if (psc->fd_render_gpu != psc->fd_display_gpu) {
