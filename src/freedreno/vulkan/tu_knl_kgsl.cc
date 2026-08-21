@@ -8,6 +8,7 @@
 #include <linux/dma-heap.h>
 #include <poll.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
@@ -805,7 +806,17 @@ wait_timestamp_safe(int fd,
 
          wait.timeout = timeout_ms;
       } else if (ret == -1) {
-         assert(errno == ETIMEDOUT);
+         /* Android KGSL reports wait timeout as ETIME (62). glibc
+          * ETIMEDOUT is 110. Aborting here killed Blender after a 3D
+          * submit; treat timeout-like errnos as VK_TIMEOUT.
+          */
+         if (errno != ETIMEDOUT && errno != EBUSY
+#ifdef ETIME
+             && errno != ETIME
+#endif
+         ) {
+            mesa_logw("KGSL WAITTIMESTAMP_CTXTID failed: %s", strerror(errno));
+         }
          return VK_TIMEOUT;
       } else {
          return VK_SUCCESS;

@@ -1863,6 +1863,21 @@ tu_setup_dynamic_render_pass(struct tu_cmd_buffer *cmd_buffer,
 
    pass->attachment_count = a;
 
+   /* Spec loadOp/storeOp are ignored across suspend/resume. When each
+    * command buffer is tiled as its own pass, the previous half must STORE
+    * and the next half must LOAD or the image is lost.
+    */
+   if (info->flags & VK_RENDERING_SUSPENDING_BIT) {
+      for (uint32_t i = 0; i < pass->attachment_count; i++)
+         pass->attachments[i].store = true;
+   }
+   if (info->flags & VK_RENDERING_RESUMING_BIT) {
+      for (uint32_t i = 0; i < pass->attachment_count; i++) {
+         if (!pass->attachments[i].clear_mask)
+            pass->attachments[i].load = true;
+      }
+   }
+
    tu_render_pass_check_ib2_skip(pass);
    tu_render_pass_cond_config(device, pass);
    tu_render_pass_gmem_config(pass, device->physical_device);

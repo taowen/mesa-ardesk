@@ -7387,9 +7387,11 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
    if (!cmd->patchpoints_ctx)
       cmd->patchpoints_ctx = ralloc_context(NULL);
 
-   if (!resuming) {
-      tu_emit_subpass_begin<CHIP>(cmd);
-   } else {
+   /* Always emit loads/clears. Resume-only and split QueueSubmits never
+    * merge at submit time, so skipping this left the second half empty.
+    */
+   tu_emit_subpass_begin<CHIP>(cmd);
+   if (resuming) {
       /* Even resuming vkCmdBeginRendering resets RT and input attachment locations, so we have to re-emit them. */
       tu_emit_rendering_attachment_locations<CHIP>(cmd);
       tu_set_input_attachments<CHIP>(cmd, cmd->state.subpass);
@@ -9957,9 +9959,8 @@ tu_CmdEndRendering2EXT(VkCommandBuffer commandBuffer,
        * resuming renderpass, which cannot inherit our CPU-tracked LRZ state.
        */
       TU_CALLX(cmd_buffer->device, tu_lrz_flush_valid_at_suspending_rp_boundary)(cmd_buffer, &cmd_buffer->draw_cs);
-   } else {
-      TU_CALLX(cmd_buffer->device, tu_emit_custom_resolve_end)(cmd_buffer);
    }
+   TU_CALLX(cmd_buffer->device, tu_emit_custom_resolve_end)(cmd_buffer);
 
    const VkRenderPassFragmentDensityMapOffsetEndInfoEXT *fdm_offset_info =
       vk_find_struct_const(pRenderingEndInfo,
@@ -9976,39 +9977,15 @@ tu_CmdEndRendering2EXT(VkCommandBuffer commandBuffer,
       fdm_offsets = test_offsets;
    }
 
-   if (!cmd_buffer->state.suspending) {
-      tu_cs_end(&cmd_buffer->draw_cs);
-      tu_cs_end(&cmd_buffer->draw_epilogue_cs);
-
-      /* A command buffer that starts with RESUMING and ends the chain here
-       * used to only stash pre_chain for a later submit-time merge. Blender
-       * 4.3 GPUOffScreen submits that buffer alone, so the merge helper is
-       * NULL. Render now while pass state is still valid.
-       */
-      TU_CALLX(cmd_buffer->device, tu_cmd_render)(cmd_buffer, fdm_offsets);
-
-      tu_reset_render_pass(cmd_buffer);
-   }
-
-   if (cmd_buffer->state.resuming && !cmd_buffer->state.suspending) {
-      /* exiting suspend/resume chain */
-      switch (cmd_buffer->state.suspend_resume) {
-      case SR_IN_CHAIN:
-      case SR_IN_PRE_CHAIN:
-         cmd_buffer->state.suspend_resume = SR_NONE;
-         break;
-      case SR_IN_CHAIN_AFTER_PRE_CHAIN:
-         cmd_buffer->state.suspend_resume = SR_AFTER_PRE_CHAIN;
-         break;
-      case SR_AFTER_PRE_CHAIN:
-      case SR_NONE:
-         break;
-      }
-   }
-
-   if (!cmd_buffer->state.suspending) {
-      cmd_buffer->state.total_renderpasses++;
-   }
+   tu_cs_end(&cmd_buffer->draw_cs);
+   tu_cs_end(&cmd_buffer->draw_epilogue_cs);
+   TU_CALLX(cmd_buffer->device, tu_cmd_render)(cmd_buffer, fdm_offsets);
+   tu_reset_render_pass(cmd_buffer);
+   /* Do not leave a dangling suspend/resume chain for submit-time merge.
+    * Each command buffer is a complete render pass (see BeginRendering).
+    */
+   cmd_buffer->state.suspend_resume = SR_NONE;
+   cmd_buffer->state.total_renderpasses++;
 }
 
 void
