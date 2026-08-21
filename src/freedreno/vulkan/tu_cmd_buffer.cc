@@ -9980,22 +9980,12 @@ tu_CmdEndRendering2EXT(VkCommandBuffer commandBuffer,
       tu_cs_end(&cmd_buffer->draw_cs);
       tu_cs_end(&cmd_buffer->draw_epilogue_cs);
 
-      if (cmd_buffer->state.suspend_resume == SR_IN_PRE_CHAIN) {
-         tu_save_pre_chain(cmd_buffer);
-         cmd_buffer->pre_chain.fdm_offset = !!fdm_offsets;
-         if (fdm_offsets) {
-            memcpy(cmd_buffer->pre_chain.fdm_offsets,
-                   fdm_offsets, sizeof(VkOffset2D) *
-                   tu_fdm_num_layers(cmd_buffer));
-         }
-
-         /* Even we don't call tu_cmd_render here, renderpass is finished
-          * and draw states should be disabled.
-          */
-         tu_disable_draw_states(cmd_buffer, &cmd_buffer->cs);
-      } else {
-         TU_CALLX(cmd_buffer->device, tu_cmd_render)(cmd_buffer, fdm_offsets);
-      }
+      /* A command buffer that starts with RESUMING and ends the chain here
+       * used to only stash pre_chain for a later submit-time merge. Blender
+       * 4.3 GPUOffScreen submits that buffer alone, so the merge helper is
+       * NULL. Render now while pass state is still valid.
+       */
+      TU_CALLX(cmd_buffer->device, tu_cmd_render)(cmd_buffer, fdm_offsets);
 
       tu_reset_render_pass(cmd_buffer);
    }
@@ -10004,14 +9994,15 @@ tu_CmdEndRendering2EXT(VkCommandBuffer commandBuffer,
       /* exiting suspend/resume chain */
       switch (cmd_buffer->state.suspend_resume) {
       case SR_IN_CHAIN:
+      case SR_IN_PRE_CHAIN:
          cmd_buffer->state.suspend_resume = SR_NONE;
          break;
-      case SR_IN_PRE_CHAIN:
       case SR_IN_CHAIN_AFTER_PRE_CHAIN:
          cmd_buffer->state.suspend_resume = SR_AFTER_PRE_CHAIN;
          break;
-      default:
-         UNREACHABLE("suspending render pass not followed by resuming pass");
+      case SR_AFTER_PRE_CHAIN:
+      case SR_NONE:
+         break;
       }
    }
 

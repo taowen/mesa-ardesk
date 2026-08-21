@@ -143,6 +143,9 @@ tu_insert_dynamic_cmdbufs(struct tu_device *dev,
 
       case SR_AFTER_PRE_CHAIN:
       case SR_IN_CHAIN_AFTER_PRE_CHAIN:
+         /* A lone AFTER_PRE_CHAIN buffer already rendered at EndRendering. */
+         if (!cmd_buffer)
+            break;
          tu_append_pre_chain(cmd_buffer, old_cmds[i]);
 
          const struct VkOffset2D *fdm_offsets =

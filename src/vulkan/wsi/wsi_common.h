@@ -111,6 +111,9 @@ struct wsi_device {
    /* Create headless swapchains. */
    bool force_headless_swapchain;
 
+   /* X11/XCB WSI talks to anlabwc over present.sock (AHB2). */
+   bool ardesk_wsi;
+
    bool force_swapchain_to_currentExtent;
 
    bool disable_unordered_submits;
@@ -241,6 +244,7 @@ struct wsi_device {
    WSI_CB(GetImageMemoryRequirements);
    WSI_CB(GetImageSubresourceLayout);
    WSI_CB(GetMemoryFdKHR);
+   WSI_CB(GetMemoryFdPropertiesKHR);
    WSI_CB(GetPhysicalDeviceCalibrateableTimeDomainsKHR);
    WSI_CB(GetPhysicalDeviceProperties);
    WSI_CB(GetPhysicalDeviceFormatProperties);

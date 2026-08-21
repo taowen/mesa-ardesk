@@ -626,6 +626,9 @@ wsi_GetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physicalDevice,
    VK_FROM_HANDLE(vk_physical_device, pdevice, physicalDevice);
    struct wsi_device *wsi_device = pdevice->wsi_device;
 
+   if (wsi_device->ardesk_wsi)
+      return true;
+
    /* These should overlap. */
    uint64_t effective_queues = wsi_device->queue_supports_blit & wsi_device->queue_supports_timestamps;
 
@@ -643,7 +646,7 @@ wsi_GetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physicalDevice,
    if (!wsi_conn)
       return false;
 
-   if (!wsi_device->sw) {
+   if (!wsi_device->sw && !wsi_device->ardesk_wsi) {
       if (!wsi_x11_check_for_dri3(wsi_conn))
          return false;
    }

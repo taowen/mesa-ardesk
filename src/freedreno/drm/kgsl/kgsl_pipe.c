@@ -99,6 +99,18 @@ kgsl_pipe_get_param(struct fd_pipe *pipe, enum fd_param_id param,
       return -1;
    case FD_TIMESTAMP:
       return -1;
+   case FD_CTX_FAULTS:
+   case FD_GLOBAL_FAULTS:
+   case FD_SUSPEND_COUNT:
+      /* KGSL has no MSM-style fault/suspend counters. Treat as zero
+       * so GLES context reset queries do not abort().
+       */
+      *value = 0;
+      return 0;
+   case FD_VA_SIZE:
+   case FD_SYSPROF:
+   case FD_UCHE_TRAP_BASE:
+      return -1;
    default:
       ERROR_MSG("invalid param id: %d", param);
       return -1;

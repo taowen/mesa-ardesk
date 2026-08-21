@@ -540,6 +540,11 @@ struct wsi_interface {
                                 struct wsi_swapchain **swapchain);
 };
 
+bool wsi_ardesk_available(void);
+VkResult wsi_ardesk_init_wsi(struct wsi_device *wsi_device,
+                             const VkAllocationCallbacks *alloc);
+void wsi_ardesk_finish_wsi(struct wsi_device *wsi_device,
+                           const VkAllocationCallbacks *alloc);
 VkResult wsi_x11_init_wsi(struct wsi_device *wsi_device,
                           const VkAllocationCallbacks *alloc,
                           const struct driOptionCache *dri_options);

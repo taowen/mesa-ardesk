@@ -218,8 +218,10 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(GetImageDrmFormatModifierPropertiesEXT);
    WSI_GET_CB(GetImageMemoryRequirements);
    WSI_GET_CB(GetImageSubresourceLayout);
-   if (!wsi->sw)
+   if (!wsi->sw) {
       WSI_GET_CB(GetMemoryFdKHR);
+      WSI_GET_CB(GetMemoryFdPropertiesKHR);
+   }
    WSI_GET_CB(GetPhysicalDeviceCalibrateableTimeDomainsKHR);
    WSI_GET_CB(GetPhysicalDeviceProperties);
    WSI_GET_CB(GetPhysicalDeviceFormatProperties);
@@ -240,7 +242,12 @@ wsi_device_init(struct wsi_device *wsi,
 #undef WSI_GET_CB
 
 #if defined(VK_USE_PLATFORM_XCB_KHR)
-   result = wsi_x11_init_wsi(wsi, alloc, dri_options);
+   if (wsi_ardesk_available()) {
+      wsi->ardesk_wsi = true;
+      result = wsi_ardesk_init_wsi(wsi, alloc);
+   } else {
+      result = wsi_x11_init_wsi(wsi, alloc, dri_options);
+   }
    if (result != VK_SUCCESS)
       goto fail;
 #endif
@@ -353,7 +360,10 @@ wsi_device_finish(struct wsi_device *wsi,
    wsi_win32_finish_wsi(wsi, alloc);
 #endif
 #if defined(VK_USE_PLATFORM_XCB_KHR)
-   wsi_x11_finish_wsi(wsi, alloc);
+   if (wsi->ardesk_wsi)
+      wsi_ardesk_finish_wsi(wsi, alloc);
+   else
+      wsi_x11_finish_wsi(wsi, alloc);
 #endif
 #if defined(VK_USE_PLATFORM_METAL_EXT)
    wsi_metal_finish_wsi(wsi, alloc);
