@@ -16,7 +16,7 @@ zink_vertex_inputs_prepare(struct zink_context *ctx, const nir_shader *nir,
    inputs->first_binding = 0;
    inputs->index_size = info->index_size;
    inputs->primitive_restart = info->primitive_restart;
-   inputs->restart_index = info->restart_index;
+   inputs->restart_index = info->primitive_restart ? info->restart_index : 0;
    unsigned used = 0;
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {

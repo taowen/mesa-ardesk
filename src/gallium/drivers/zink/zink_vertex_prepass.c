@@ -5,6 +5,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "zink_vertex_pull.h"
 #include "util/u_inlines.h"
+#include "util/u_draw.h"
 
 /* Development path, deliberately not used to raise GL/Vulkan capabilities.
  * Reserved bindings are checked before any application shader is converted. */
@@ -300,14 +301,22 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
    struct zink_screen *screen = zink_screen(pctx->screen);
    struct zink_shader *vs = ctx->gfx_stages[MESA_SHADER_VERTEX];
    if (ctx->vertex_prepass_active || !vs || !vs->vertex_prepass_nir ||
-       indirect || num_draws != 1 || !draws[0].count || !info->instance_count ||
+       indirect || !num_draws || !info->instance_count ||
        ctx->gfx_stages[MESA_SHADER_TESS_CTRL] || ctx->gfx_stages[MESA_SHADER_TESS_EVAL] ||
        ctx->gfx_stages[MESA_SHADER_GEOMETRY] || ctx->num_so_targets || ctx->render_condition_active ||
        (ctx->bs && ctx->bs->active_queries.entries) || !list_is_empty(&ctx->suspended_queries) ||
        screen->info.props.limits.maxPerStageDescriptorUniformBuffers < PREPASS_UBO + 1 ||
        screen->info.props.limits.maxPerStageDescriptorStorageBuffers < PREPASS_SSBO + 1 ||
-       draws[0].count > screen->info.props.limits.maxComputeWorkGroupCount[0] ||
        info->instance_count > screen->info.props.limits.maxComputeWorkGroupCount[1])
+      return false;
+   if (num_draws > 1) {
+      /* Re-enter for each subdraw so state restoration and native fallback
+       * remain local to that draw. Empty draws still advance DrawID. */
+      util_draw_multi(pctx, info, drawid_offset, NULL, draws, num_draws);
+      return true;
+   }
+   if (!draws[0].count ||
+       draws[0].count > screen->info.props.limits.maxComputeWorkGroupCount[0])
       return false;
    struct zink_vertex_inputs inputs = {0};
    if (!zink_vertex_inputs_prepare(ctx, vs->vertex_prepass_nir, info, draws, &inputs))
@@ -432,9 +441,9 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
    zink_vertex_inputs_finish(pctx, &inputs);
    pipe_resource_release(pctx, output);
    ctx->vertex_prepass_active = false;
-   mesa_logi("ZINK_VERTEX_PREPASS draw vertices=%u instances=%u inputs=%u index_size=%u restart=%u restart_index=%u input_binding=%s input_texels=%u input_ssbos=%u",
+   mesa_logi("ZINK_VERTEX_PREPASS draw vertices=%u instances=%u inputs=%u index_size=%u restart=%u restart_index=%u input_binding=%s input_texels=%u input_ssbos=%u drawid=%u",
              draws[0].count, info->instance_count, inputs.count, (unsigned)info->index_size,
-             (unsigned)info->primitive_restart, info->restart_index, inputs.texel_count ? (inputs.ssbo_count ? "mixed" : "texel") : "ssbo",
-             inputs.texel_count, inputs.ssbo_count);
+             (unsigned)info->primitive_restart, info->primitive_restart ? info->restart_index : 0, inputs.texel_count ? (inputs.ssbo_count ? "mixed" : "texel") : "ssbo",
+             inputs.texel_count, inputs.ssbo_count, drawid_offset);
    return true;
 }
