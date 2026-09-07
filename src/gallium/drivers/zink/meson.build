@@ -9,6 +9,7 @@ files_libzink = files(
   'zink_clear.c',
   'zink_compiler.c',
   'zink_vertex_prepass.c',
+  'zink_vertex_pull.c',
   'zink_instance_rebase.c',
   'zink_context.c',
   'zink_kopper.c',

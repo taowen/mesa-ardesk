@@ -3,14 +3,13 @@
 #include "zink_context.h"
 #include "zink_screen.h"
 #include "compiler/nir/nir_builder.h"
-#include "compiler/nir/nir_format_convert.h"
-#include "util/format/u_format.h"
+#include "zink_vertex_pull.h"
 #include "util/u_inlines.h"
 
 /* Development path, deliberately not used to raise GL/Vulkan capabilities.
  * Reserved bindings are checked before any application shader is converted. */
 #define PREPASS_UBO 15
-#define PREPASS_SSBO 15
+#define PREPASS_SSBO ZINK_VERTEX_INPUT_BUFFERS
 #define PREPASS_STRIDE (VARYING_SLOT_MAX * 16)
 
 static bool
@@ -33,7 +32,7 @@ nir_shader *
 zink_vertex_prepass_prepare(const nir_shader *nir)
 {
    if (nir->info.stage != MESA_SHADER_VERTEX || !nir->info.io_lowered ||
-       nir->info.outputs_read || nir->info.num_textures ||
+       nir->info.outputs_read ||
        nir->info.num_images || nir->info.num_abos || nir->info.uses_bindless ||
        nir->info.clip_distance_array_size || nir->info.cull_distance_array_size ||
        nir->info.vs.window_space_position || nir->xfb_info ||
@@ -46,7 +45,7 @@ zink_vertex_prepass_prepare(const nir_shader *nir)
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_tex || instr->type == nir_instr_type_call)
+            if (instr->type == nir_instr_type_call)
                return NULL;
             if (instr->type != nir_instr_type_intrinsic)
                continue;
@@ -67,77 +66,6 @@ zink_vertex_prepass_prepare(const nir_shader *nir)
       }
    }
    return nir_shader_clone(NULL, nir);
-}
-
-struct prepass_inputs {
-   struct pipe_vertex_element elements[PIPE_MAX_ATTRIBS];
-   unsigned slots[PIPE_MAX_ATTRIBS];
-   unsigned offsets[PIPE_MAX_ATTRIBS];
-   struct pipe_shader_buffer buffers[PREPASS_SSBO];
-   unsigned count;
-};
-
-/* Bind the original storage: no CPU readback or staging copy is needed. The
- * current decoder requires word-aligned fetches and excludes 64-bit inputs. */
-static bool
-prepare_inputs(struct zink_context *ctx, const nir_shader *nir,
-               const struct pipe_draw_info *info,
-               const struct pipe_draw_start_count_bias *draw,
-               struct prepass_inputs *inputs)
-{
-   unsigned used = 0;
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            if (intr->intrinsic != nir_intrinsic_load_input)
-               continue;
-            unsigned index = nir_intrinsic_base(intr);
-            if (!ctx->element_state || index >= ctx->element_state->num_elements || index >= 32)
-               return false;
-            if (used & BITFIELD_BIT(index))
-               continue;
-            used |= BITFIELD_BIT(index);
-            unsigned slot = nir->info.num_ssbos + inputs->count;
-            if (slot >= PREPASS_SSBO)
-               return false;
-            const struct pipe_vertex_element *elem = &ctx->element_state->elements[index];
-            const struct pipe_vertex_buffer *vb = &ctx->vertex_buffers[elem->vertex_buffer_index];
-            const struct util_format_description *desc = util_format_description(elem->src_format);
-            if (elem->dual_slot || vb->is_user_buffer || !vb->buffer.resource ||
-                desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || !desc->block.bits ||
-                desc->block.bits > 128 || desc->block.bits % 32 ||
-                elem->src_stride % 4 || (vb->buffer_offset + elem->src_offset) % 4)
-               return false;
-            bool packed_float = elem->src_format == PIPE_FORMAT_R11G11B10_FLOAT ||
-                                elem->src_format == PIPE_FORMAT_R9G9B9E5_FLOAT;
-            for (unsigned c = 0; c < desc->nr_channels && !packed_float; c++) {
-               const struct util_format_channel_description *ch = &desc->channel[c];
-               if (ch->size > 32 || ch->type == UTIL_FORMAT_TYPE_FIXED ||
-                   (ch->type == UTIL_FORMAT_TYPE_FLOAT && ch->size != 16 && ch->size != 32) ||
-                   (desc->block.bits > 32 && ch->size != desc->channel[0].size))
-                  return false;
-            }
-            uint64_t last = elem->instance_divisor ?
-               (uint64_t)info->start_instance + (info->instance_count - 1) / elem->instance_divisor :
-               (uint64_t)draw->start + draw->count - 1;
-            uint64_t offset = (uint64_t)vb->buffer_offset + elem->src_offset;
-            uint64_t end = offset + last * elem->src_stride + desc->block.bits / 8;
-            if (end > vb->buffer.resource->width0 || end > UINT32_MAX ||
-                vb->buffer.resource->width0 > zink_screen(ctx->base.screen)->info.props.limits.maxStorageBufferRange)
-               return false;
-            inputs->elements[index] = *elem;
-            inputs->slots[index] = slot;
-            inputs->offsets[index] = offset;
-            inputs->buffers[inputs->count++] = (struct pipe_shader_buffer) {
-               .buffer = vb->buffer.resource, .buffer_size = vb->buffer.resource->width0,
-            };
-         }
-      }
-   }
-   return true;
 }
 
 static nir_def *
@@ -193,18 +121,14 @@ lower_to_compute(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_def *value = NULL;
    switch (intr->intrinsic) {
    case nir_intrinsic_load_input: {
-      const struct prepass_inputs *inputs = data;
+      const struct zink_vertex_inputs *inputs = data;
       unsigned index = nir_intrinsic_base(intr);
       const struct pipe_vertex_element *elem = &inputs->elements[index];
       nir_def *id = nir_load_global_invocation_id(b, 32);
       nir_def *record = elem->instance_divisor ?
          nir_iadd(b, parameter(b, 3), nir_udiv_imm(b, nir_channel(b, id, 1), elem->instance_divisor)) :
          nir_iadd(b, parameter(b, 1), nir_channel(b, id, 0));
-      nir_def *offset = nir_iadd_imm(b, nir_imul_imm(b, record, elem->src_stride), inputs->offsets[index]);
-      nir_def *packed = nir_load_ssbo(b, util_format_get_blocksize(elem->src_format) / 4, 32,
-                                     nir_imm_int(b, inputs->slots[index]), offset,
-                                     .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
-      nir_def *rgba = nir_format_unpack_rgba(b, packed, elem->src_format);
+      nir_def *rgba = zink_vertex_input_load(b, inputs, index, record);
       unsigned channels[4];
       for (unsigned c = 0; c < intr->num_components; c++)
          channels[c] = nir_intrinsic_component(intr) + c;
@@ -243,7 +167,7 @@ lower_to_compute(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 static void
-make_shaders(const nir_shader *source, struct prepass_inputs *inputs,
+make_shaders(const nir_shader *source, struct zink_vertex_inputs *inputs,
              nir_shader **compute, nir_shader **replay)
 {
    nir_builder rb = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, source->options,
@@ -252,6 +176,11 @@ make_shaders(const nir_shader *source, struct prepass_inputs *inputs,
    rb.shader->info.name = ralloc_strdup(rb.shader, "zink vertex prepass replay");
    rb.shader->info.internal = true;
    rb.shader->info.inputs_read = 0;
+   rb.shader->info.num_textures = 0;
+   BITSET_ZERO(rb.shader->info.textures_used);
+   BITSET_ZERO(rb.shader->info.textures_used_by_txf);
+   BITSET_ZERO(rb.shader->info.texture_buffers);
+   BITSET_ZERO(rb.shader->info.samplers_used);
    rb.shader->info.num_ubos = PREPASS_UBO + 1;
    rb.shader->info.first_ubo_is_default_ubo = true;
    rb.shader->info.num_ssbos = PREPASS_SSBO + 1;
@@ -283,6 +212,9 @@ make_shaders(const nir_shader *source, struct prepass_inputs *inputs,
    *replay = rb.shader;
 
    nir_shader *cs = nir_shader_clone(NULL, source);
+   /* Resolve implicit vertex LOD before changing stages. */
+   nir_lower_tex_options tex_options = {.lower_invalid_implicit_lod = true};
+   NIR_PASS(_, cs, nir_lower_tex, &tex_options);
    cs->info.stage = MESA_SHADER_COMPUTE;
    cs->info.internal = true;
    cs->info.prev_stage = cs->info.next_stage = MESA_SHADER_NONE;
@@ -333,16 +265,20 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
        draws[0].count > screen->info.props.limits.maxComputeWorkGroupCount[0] ||
        info->instance_count > screen->info.props.limits.maxComputeWorkGroupCount[1])
       return false;
-   struct prepass_inputs inputs = {0};
-   if (!prepare_inputs(ctx, vs->vertex_prepass_nir, info, draws, &inputs))
+   struct zink_vertex_inputs inputs = {0};
+   if (!zink_vertex_inputs_prepare(ctx, vs->vertex_prepass_nir, info, draws, &inputs))
       return false;
    uint64_t size = (uint64_t)draws[0].count * info->instance_count * PREPASS_STRIDE;
-   if (size > UINT32_MAX || size > screen->info.props.limits.maxStorageBufferRange)
+   if (size > UINT32_MAX || size > screen->info.props.limits.maxStorageBufferRange) {
+      zink_vertex_inputs_finish(pctx, &inputs);
       return false;
+   }
    struct pipe_resource *output = pipe_buffer_create(pctx->screen, PIPE_BIND_SHADER_BUFFER,
                                                      PIPE_USAGE_DEFAULT, size);
-   if (!output)
+   if (!output) {
+      zink_vertex_inputs_finish(pctx, &inputs);
       return false;
+   }
    ctx->vertex_prepass_active = true;
    nir_shader *cs, *replay;
    make_shaders(vs->vertex_prepass_nir, &inputs, &cs, &replay);
@@ -353,11 +289,32 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
    if (!compute_cso || !replay_cso) {
       if (compute_cso) pctx->delete_compute_state(pctx, compute_cso);
       if (replay_cso) pctx->delete_vs_state(pctx, replay_cso);
+      zink_vertex_inputs_finish(pctx, &inputs);
       pipe_resource_release(pctx, output);
       ctx->vertex_prepass_active = false;
       return false;
    }
    struct zink_compute_program *saved_compute = ctx->curr_compute;
+   struct pipe_sampler_view *saved_views[PIPE_MAX_SAMPLERS] = {0};
+   void *saved_samplers[PIPE_MAX_SAMPLERS];
+   unsigned saved_view_count = ctx->di.num_sampler_views[MESA_SHADER_COMPUTE];
+   unsigned saved_sampler_count = ctx->di.num_samplers[MESA_SHADER_COMPUTE];
+   unsigned vertex_view_count = ctx->di.num_sampler_views[MESA_SHADER_VERTEX];
+   unsigned vertex_sampler_count = ctx->di.num_samplers[MESA_SHADER_VERTEX];
+   unsigned sampler_count = MAX2(saved_sampler_count, vertex_sampler_count);
+   for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++) {
+      /* A deleted GL texture can remain alive only through this binding. */
+      pipe_sampler_view_reference(&saved_views[i], ctx->sampler_views[MESA_SHADER_COMPUTE][i]);
+      saved_samplers[i] = ctx->sampler_states[MESA_SHADER_COMPUTE][i];
+   }
+   pctx->set_sampler_views(pctx, MESA_SHADER_COMPUTE, 0, vertex_view_count,
+                          saved_view_count > vertex_view_count ? saved_view_count - vertex_view_count : 0,
+                          ctx->sampler_views[MESA_SHADER_VERTEX]);
+   void *vertex_samplers[PIPE_MAX_SAMPLERS] = {0};
+   for (unsigned i = 0; i < vertex_sampler_count; i++)
+      vertex_samplers[i] = ctx->sampler_states[MESA_SHADER_VERTEX][i];
+   pctx->bind_sampler_states(pctx, MESA_SHADER_COMPUTE, 0, sampler_count, vertex_samplers);
+   ctx->di.num_samplers[MESA_SHADER_COMPUTE] = vertex_sampler_count;
    struct pipe_constant_buffer saved_ubos[PREPASS_UBO + 1];
    struct pipe_shader_buffer saved_ssbos[PREPASS_SSBO + 1];
    memcpy(saved_ubos, ctx->ubos[MESA_SHADER_COMPUTE], sizeof(saved_ubos));
@@ -394,8 +351,16 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
    for (unsigned i = 0; i <= PREPASS_UBO; i++)
       bind_ubo(pctx, MESA_SHADER_COMPUTE, i, &saved_ubos[i]);
    pctx->set_shader_buffers(pctx, MESA_SHADER_COMPUTE, 0, PREPASS_SSBO + 1, saved_ssbos, saved_writable);
+   pctx->set_sampler_views(pctx, MESA_SHADER_COMPUTE, 0, saved_view_count,
+                          vertex_view_count > saved_view_count ? vertex_view_count - saved_view_count : 0,
+                          saved_views);
+   pctx->bind_sampler_states(pctx, MESA_SHADER_COMPUTE, 0, sampler_count, saved_samplers);
+   ctx->di.num_samplers[MESA_SHADER_COMPUTE] = saved_sampler_count;
+   for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++)
+      pipe_sampler_view_reference(&saved_views[i], NULL);
    pctx->delete_compute_state(pctx, compute_cso);
    pctx->delete_vs_state(pctx, replay_cso);
+   zink_vertex_inputs_finish(pctx, &inputs);
    pipe_resource_release(pctx, output);
    ctx->vertex_prepass_active = false;
    mesa_logi("ZINK_VERTEX_PREPASS draw vertices=%u instances=%u inputs=%u", draws[0].count, info->instance_count, inputs.count);
