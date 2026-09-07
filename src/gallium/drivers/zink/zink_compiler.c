@@ -107,6 +107,7 @@ fields[member_idx].offset = offsetof(struct zink_gfx_push_constant, field);
    PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_LINE_STIPPLE_PATTERN, line_stipple_pattern);
    PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_VIEWPORT_SCALE, viewport_scale);
    PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_LINE_WIDTH, line_width);
+   PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_BASE_INSTANCE_OFFSET, base_instance_offset);
 
    pushconst = nir_variable_create(nir, nir_var_mem_push_const,
                                    glsl_struct_type(fields, ZINK_GFX_PUSHCONST_MAX, "struct", false),
@@ -4390,6 +4391,22 @@ zink_shader_compile_separate(struct zink_screen *screen, struct zink_shader *zs)
    return obj;
 }
 
+/* Preserve the application's BaseInstance when native fetch must use zero.
+ * Run before lower_baseinstance so its InstanceID subtraction continues to
+ * use the raw Vulkan BaseInstance rather than this application value. */
+static bool
+lower_rebased_baseinstance(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_base_instance)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *offset = nir_load_push_constant_zink(b, 1, 32,
+                          nir_imm_int(b, ZINK_GFX_PUSHCONST_BASE_INSTANCE_OFFSET));
+   nir_def *value = nir_iadd(b, &intr->def, offset);
+   nir_def_rewrite_uses_after(&intr->def, value);
+   return true;
+}
+
 static bool
 lower_baseinstance_instr(nir_builder *b, nir_intrinsic_instr *intr,
                          void *data)
@@ -5746,6 +5763,10 @@ zink_shader_init(struct zink_screen *screen, struct zink_shader *zs)
       NIR_PASS(_, nir, fixup_io_locations);
 
    NIR_PASS(_, nir, lower_basevertex);
+   if (nir->info.stage == MESA_SHADER_VERTEX &&
+       !screen->info.vdiv_supports_nonzero_first_instance)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_rebased_baseinstance,
+               nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, lower_baseinstance);
    NIR_PASS(_, nir, split_bitfields);
    if (!screen->info.feats.features.shaderStorageImageMultisample)

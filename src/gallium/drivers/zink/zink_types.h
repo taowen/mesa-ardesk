@@ -984,6 +984,7 @@ struct zink_gfx_push_constant {
    uint32_t line_stipple_pattern;
    float viewport_scale[2];
    float line_width;
+   unsigned base_instance_offset;
 };
 
 /* The order of the enums MUST match the order of the zink_gfx_push_constant
@@ -998,6 +999,7 @@ enum zink_gfx_push_constant_member {
    ZINK_GFX_PUSHCONST_LINE_STIPPLE_PATTERN,
    ZINK_GFX_PUSHCONST_VIEWPORT_SCALE,
    ZINK_GFX_PUSHCONST_LINE_WIDTH,
+   ZINK_GFX_PUSHCONST_BASE_INSTANCE_OFFSET,
    ZINK_GFX_PUSHCONST_MAX
 };
 
@@ -1769,6 +1771,7 @@ struct zink_context {
    unsigned inlinable_uniforms_valid_mask;
 
    bool vertex_prepass_active;
+   unsigned base_instance_offset;
    struct pipe_constant_buffer ubos[MESA_SHADER_MESH_STAGES][PIPE_MAX_CONSTANT_BUFFERS];
    struct pipe_shader_buffer ssbos[MESA_SHADER_MESH_STAGES][PIPE_MAX_SHADER_BUFFERS];
    uint32_t writable_ssbos[MESA_SHADER_MESH_STAGES];

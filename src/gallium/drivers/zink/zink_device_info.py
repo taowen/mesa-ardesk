@@ -424,6 +424,7 @@ struct zink_screen;
 
 struct zink_device_info {
    uint32_t device_version;
+   bool vdiv_supports_nonzero_first_instance;
 
 %for ext in extensions:
    <%helpers:guard ext="${ext}">
@@ -597,6 +598,8 @@ zink_get_physical_device_info(struct zink_screen *screen)
    // Unlike the feature structure, the KHR divisor properties are not an
    // alias of EXT: they have a new sType and an additional field.
    VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR vdiv_khr_props = {0};
+   // EXT required support for nonzero firstInstance; KHR/core expose a limit.
+   info->vdiv_supports_nonzero_first_instance = true;
    // check for device properties
    bool copy_layered_props = false;
    if (screen->vk.GetPhysicalDeviceProperties2) {
@@ -670,8 +673,12 @@ zink_get_physical_device_info(struct zink_screen *screen)
 
       // note: setting up local VkPhysicalDeviceProperties2.
       screen->vk.GetPhysicalDeviceProperties2(screen->pdev, &props);
-      if (support_KHR_vertex_attribute_divisor && !info->have_vulkan14)
+      if (info->have_vulkan14) {
+         info->vdiv_supports_nonzero_first_instance = info->props14.supportsNonZeroFirstInstance;
+      } else if (support_KHR_vertex_attribute_divisor) {
          info->vdiv_props.maxVertexAttribDivisor = vdiv_khr_props.maxVertexAttribDivisor;
+         info->vdiv_supports_nonzero_first_instance = vdiv_khr_props.supportsNonZeroFirstInstance;
+      }
 
       if (support_KHR_maintenance7 && layered_props_list.layeredApiCount) {
         info->vk_layered_props = vk_layered_props.properties.properties;

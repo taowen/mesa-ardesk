@@ -10,6 +10,7 @@
 #include "zink_state.h"
 #include "zink_inlines.h"
 #include "zink_vertex_prepass.h"
+#include "zink_instance_rebase.h"
 
 #include "util/hash_table.h"
 #include "util/u_cpu_detect.h"
@@ -222,7 +223,7 @@ update_gfx_pipeline(struct zink_context *ctx, struct zink_batch_state *bs, enum 
 {
    VkPipeline prev_pipeline = ctx->gfx_pipeline_state.pipeline;
    const struct zink_screen *screen = zink_screen(ctx->base.screen);
-   bool shaders_changed = ctx->gfx_dirty || ctx->dirty_gfx_stages;
+   bool shaders_changed = ctx->gfx_dirty || ctx->dirty_gfx_stages || ctx->last_vertex_stage_dirty;
    if (screen->optimal_keys && !ctx->is_generated_gs_bound)
       zink_gfx_program_update_optimal(ctx);
    else
@@ -696,7 +697,7 @@ zink_draw(struct pipe_context *pctx,
    if (have_streamout && ctx->dirty_so_targets)
       zink_emit_stream_output_targets(pctx);
 
-   bool pipeline_changed = ctx->gfx_pipeline_state.dirty || rp_state != ctx->gfx_pipeline_state.rp_state || ctx->gfx_dirty || ctx->dirty_gfx_stages || prim_changed || BATCH_CHANGED ?
+   bool pipeline_changed = ctx->gfx_pipeline_state.dirty || rp_state != ctx->gfx_pipeline_state.rp_state || ctx->gfx_dirty || ctx->dirty_gfx_stages || ctx->last_vertex_stage_dirty || prim_changed || BATCH_CHANGED ?
                            update_gfx_pipeline<DYNAMIC_STATE, BATCH_CHANGED>(ctx, bs, mode) :
                            false;
 
@@ -761,6 +762,10 @@ zink_draw(struct pipe_context *pctx,
        ctx->curr_program->base.dd.bindless)
       zink_descriptors_update_bindless(ctx);
 
+   if (!screen->info.vdiv_supports_nonzero_first_instance)
+      VKCTX(CmdPushConstants)(bs->cmdbuf, ctx->curr_program->base.layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                             offsetof(struct zink_gfx_push_constant, base_instance_offset), sizeof(unsigned),
+                             &ctx->base_instance_offset);
    if (reads_basevertex) {
       unsigned draw_mode_is_indexed = index_size > 0;
       VKCTX(CmdPushConstants)(bs->cmdbuf, ctx->curr_program->base.layout, VK_SHADER_STAGE_ALL_GRAPHICS,
@@ -1123,8 +1128,11 @@ zink_draw_vbo(struct pipe_context *pctx,
               const struct pipe_draw_start_count_bias *draws,
               unsigned num_draws)
 {
-   if (unlikely(zink_debug & ZINK_DEBUG_VERTEX_PREPASS) &&
+   if (!zink_context(pctx)->base_instance_offset &&
+       unlikely(zink_debug & ZINK_DEBUG_VERTEX_PREPASS) &&
        zink_vertex_prepass_draw(pctx, info, drawid_offset, indirect, draws, num_draws))
+      return;
+   if (zink_instance_rebase_draw(pctx, info, drawid_offset, indirect, draws, num_draws))
       return;
    zink_draw<HAS_MULTIDRAW, DYNAMIC_STATE, BATCH_CHANGED, false>(pctx, info, drawid_offset, indirect, draws, num_draws, NULL, 0);
 }
