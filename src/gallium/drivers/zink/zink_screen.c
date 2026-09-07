@@ -121,6 +121,7 @@ zink_debug_options[] = {
    { "rploads", ZINK_DEBUG_RPLOADS, "Zap renderpass loads for DONT_CARE" },
    { "nogeneral", ZINK_DEBUG_NOGENERAL, "Disable GENERAL layout usage for supported hardware" },
    { "rpstores", ZINK_DEBUG_RPSTORES, "Zap renderpass stores for DONT_CARE" },
+   { "vertex_prepass", ZINK_DEBUG_VERTEX_PREPASS, "Develop compute vertex prepass without changing advertised capabilities" },
    DEBUG_NAMED_VALUE_END
 };
 

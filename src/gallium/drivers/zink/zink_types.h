@@ -264,6 +264,7 @@ enum zink_debug {
    ZINK_DEBUG_NOGENERAL = (1<<22),
    ZINK_DEBUG_RPSTORES = (1<<23),
    ZINK_DEBUG_PERFINFO = (1<<24),
+   ZINK_DEBUG_VERTEX_PREPASS = (1<<25),
 };
 
 enum zink_pv_emulation_primitive {
@@ -797,6 +798,7 @@ struct zink_shader_object {
 
 struct zink_shader {
    struct util_live_shader base;
+   nir_shader *vertex_prepass_nir;
    uint32_t hash;
    struct blob blob;
    struct shader_info info;
@@ -1763,6 +1765,7 @@ struct zink_context {
    unsigned shader_has_inlinable_uniforms_mask;
    unsigned inlinable_uniforms_valid_mask;
 
+   bool vertex_prepass_active;
    struct pipe_constant_buffer ubos[MESA_SHADER_MESH_STAGES][PIPE_MAX_CONSTANT_BUFFERS];
    struct pipe_shader_buffer ssbos[MESA_SHADER_MESH_STAGES][PIPE_MAX_SHADER_BUFFERS];
    uint32_t writable_ssbos[MESA_SHADER_MESH_STAGES];

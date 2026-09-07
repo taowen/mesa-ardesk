@@ -4088,6 +4088,14 @@ compile_module(struct zink_screen *screen, struct zink_shader *zs, nir_shader *n
 {
    prune_io(nir);
 
+   /* Buffer reconstruction discards original variable qualifiers. Read-only
+    * vertex SSBOs are legal without vertexPipelineStoresAndAtomics, but their
+    * SPIR-V variables must carry NonWritable. Infer it after buffer lowering. */
+   if (nir->info.stage == MESA_SHADER_VERTEX &&
+       !screen->info.feats.features.vertexPipelineStoresAndAtomics) {
+      const nir_opt_access_options access_options = {.is_vulkan = true};
+      NIR_PASS(_, nir, nir_opt_access, &access_options);
+   }
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
 
    if (zink_debug & (ZINK_DEBUG_NIR | ZINK_DEBUG_SPIRV))

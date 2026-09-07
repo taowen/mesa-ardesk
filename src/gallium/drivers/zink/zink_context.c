@@ -1386,8 +1386,9 @@ update_buf_bind_count(struct zink_context *ctx, struct zink_resource *res, bool 
       unsigned incr = is_compute ? 1 << 16 : 1;
       /* avoid extra atomics from checking all_binds in the next line by directly subtracting the 16bit increment */
       unsigned all_binds = p_atomic_add_return(&res->all_binds, -incr);
-      /* if hit while blitting, this will be triggered again after blitting */
-      if (res->deleted && !all_binds && !ctx->blitting)
+      /* Temporary blit/prepass bindings restore the original bindings before
+       * returning; preserve deferred ownership across their intermediate unbind. */
+      if (res->deleted && !all_binds && !ctx->blitting && !ctx->vertex_prepass_active)
          resource_release(ctx, res);
    } else
       p_atomic_inc(&res->bind_count[is_compute]);

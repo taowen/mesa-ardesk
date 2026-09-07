@@ -1500,6 +1500,8 @@ emit_bo(struct ntv_context *ctx, struct nir_variable *var, bool aliased)
 
    if (aliased)
       spirv_builder_emit_decoration(&ctx->builder, var_id, SpvDecorationAliased);
+   if (ssbo && (var->data.access & ACCESS_NON_WRITEABLE))
+      spirv_builder_emit_decoration(&ctx->builder, var_id, SpvDecorationNonWritable);
 
    unsigned idx = bitsize >> 4;
    assert(idx < ARRAY_SIZE(ctx->ssbos));

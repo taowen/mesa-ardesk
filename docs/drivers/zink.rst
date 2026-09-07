@@ -292,6 +292,20 @@ variable:
   ``spirv``
     Write the binary SPIR-V form of all compiled shaders to a file in the
     current directory, and print a message with the filename to stderr.
+  ``vertex_prepass``
+    Experimental procedural vertex-to-compute lowering. Eligible direct,
+    non-indexed vertex shaders execute as compute, followed by a vertex shader
+    reading the generated outputs. Uniform/SSBO bindings and compute state are
+    restored after the draw, with an explicit shader-buffer barrier between
+    dispatch and replay. This does not change advertised GL or Vulkan features.
+
+    Currently excludes vertex attributes, textures/images, bindless access,
+    subgroup operations, clip/cull arrays, transform feedback, geometry and
+    tessellation stages, indirect/multidraw and active queries. Reserved UBO
+    and SSBO binding 15 must be unused; dispatch and buffer-size limits are
+    checked. Other draws retain their native execution path. Internal programs
+    and output storage are created per draw, so this is a development path,
+    not a performance-ready fallback or complete vertex SSBO implementation.
   ``tgsi``
     Print the TGSI form of TGSI shaders to stderr.
   ``validation``

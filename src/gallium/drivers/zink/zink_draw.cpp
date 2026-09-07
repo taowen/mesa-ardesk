@@ -9,6 +9,7 @@
 #include "zink_screen.h"
 #include "zink_state.h"
 #include "zink_inlines.h"
+#include "zink_vertex_prepass.h"
 
 #include "util/hash_table.h"
 #include "util/u_cpu_detect.h"
@@ -1122,6 +1123,9 @@ zink_draw_vbo(struct pipe_context *pctx,
               const struct pipe_draw_start_count_bias *draws,
               unsigned num_draws)
 {
+   if (unlikely(zink_debug & ZINK_DEBUG_VERTEX_PREPASS) &&
+       zink_vertex_prepass_draw(pctx, info, drawid_offset, indirect, draws, num_draws))
+      return;
    zink_draw<HAS_MULTIDRAW, DYNAMIC_STATE, BATCH_CHANGED, false>(pctx, info, drawid_offset, indirect, draws, num_draws, NULL, 0);
 }
 

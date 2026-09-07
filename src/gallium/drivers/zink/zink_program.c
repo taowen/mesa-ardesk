@@ -22,6 +22,7 @@
  */
 
 #include "zink_program.h"
+#include "zink_vertex_prepass.h"
 
 #include "zink_compiler.h"
 #include "zink_context.h"
@@ -2635,7 +2636,13 @@ zink_create_gfx_shader_state(struct pipe_context *pctx, const struct pipe_shader
    if (nir->info.stage == MESA_SHADER_FRAGMENT && nir->info.fs.uses_fbfetch_output)
       zink_descriptor_util_init_fbfetch(zink_context(pctx));
 
+   nir_shader *prepass = NULL;
+   if ((zink_debug & ZINK_DEBUG_VERTEX_PREPASS) && !zink_context(pctx)->vertex_prepass_active)
+      prepass = zink_vertex_prepass_prepare(nir);
    struct zink_shader *zs = zink_shader_create(zink_screen(pctx->screen), nir);
+   zs->vertex_prepass_nir = prepass;
+   if (prepass)
+      ralloc_steal(zs, prepass);
    if (zink_debug & ZINK_DEBUG_NOBGC)
       gfx_shader_init_job(zs, screen, 0);
    else
