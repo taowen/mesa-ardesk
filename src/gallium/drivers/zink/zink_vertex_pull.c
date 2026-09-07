@@ -14,6 +14,9 @@ zink_vertex_inputs_prepare(struct zink_context *ctx, const nir_shader *nir,
                struct zink_vertex_inputs *inputs)
 {
    inputs->first_binding = nir->info.num_ssbos;
+   inputs->index_size = info->index_size;
+   inputs->primitive_restart = info->primitive_restart;
+   inputs->restart_index = info->restart_index;
    unsigned used = 0;
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -52,7 +55,8 @@ zink_vertex_inputs_prepare(struct zink_context *ctx, const nir_shader *nir,
             uint64_t width = vb->buffer.resource->width0;
             unsigned bytes = desc->block.bits / 8;
             if (offset > width || bytes > width - offset ||
-                (elem->src_stride && last > (width - offset - bytes) / elem->src_stride) ||
+                ((!info->index_size || elem->instance_divisor) && elem->src_stride &&
+                 last > (width - offset - bytes) / elem->src_stride) ||
                 width > zink_screen(ctx->base.screen)->info.props.limits.maxStorageBufferRange)
                return false;
             unsigned buffer = 0;
@@ -65,12 +69,34 @@ zink_vertex_inputs_prepare(struct zink_context *ctx, const nir_shader *nir,
             inputs->elements[index] = *elem;
             inputs->slots[index] = slot;
             inputs->offsets[index] = offset;
+            inputs->max_records[index] = elem->src_stride ?
+               (width - offset - bytes) / elem->src_stride : UINT32_MAX;
             if (buffer == inputs->count)
                inputs->buffers[inputs->count++] = (struct pipe_shader_buffer) {
                   .buffer = vb->buffer.resource, .buffer_size = vb->buffer.resource->width0,
                };
          }
       }
+   }
+   if (info->index_size) {
+      if (info->has_user_indices || !info->index.resource ||
+          (info->index_size != 1 && info->index_size != 2 && info->index_size != 4))
+         return false;
+      uint64_t end = ((uint64_t)draw->start + draw->count) * info->index_size;
+      struct pipe_resource *index = info->index.resource;
+      if (end > index->width0 || index->width0 >
+          zink_screen(ctx->base.screen)->info.props.limits.maxStorageBufferRange)
+         return false;
+      unsigned buffer = 0;
+      while (buffer < inputs->count && inputs->buffers[buffer].buffer != index)
+         buffer++;
+      if (nir->info.num_ssbos + buffer >= ZINK_VERTEX_INPUT_BUFFERS)
+         return false;
+      inputs->index_slot = nir->info.num_ssbos + buffer;
+      if (buffer == inputs->count)
+         inputs->buffers[inputs->count++] = (struct pipe_shader_buffer) {
+            .buffer = index, .buffer_size = index->width0,
+         };
    }
    inputs->source_count = inputs->count;
    unsigned tail_size = 0;
@@ -137,6 +163,9 @@ zink_vertex_input_load(nir_builder *b, const struct zink_vertex_inputs *inputs,
    const struct pipe_vertex_element *elem = &inputs->elements[index];
    unsigned buffer = inputs->slots[index] - first_binding;
    unsigned bits = util_format_get_blocksizebits(elem->src_format);
+   bool guarded = inputs->index_size && !elem->instance_divisor;
+   if (guarded)
+      nir_push_if(b, nir_ule_imm(b, record, inputs->max_records[index]));
    nir_def *offset = nir_iadd_imm(b, nir_imul_imm(b, record, elem->src_stride), inputs->offsets[index]);
    nir_def *aligned = nir_iand_imm(b, offset, ~3u);
    nir_def *shift = nir_imul_imm(b, nir_iand_imm(b, offset, 3), 8);
@@ -151,7 +180,24 @@ zink_vertex_input_load(nir_builder *b, const struct zink_vertex_inputs *inputs,
       nir_pop_if(b, NULL);
       words[i] = nir_if_phi(b, merged, low);
    }
-   return nir_format_unpack_rgba(b, nir_vec(b, words, DIV_ROUND_UP(bits, 32)), elem->src_format);
+   nir_def *rgba = nir_format_unpack_rgba(b, nir_vec(b, words, DIV_ROUND_UP(bits, 32)), elem->src_format);
+   if (guarded) {
+      nir_push_else(b, NULL);
+      nir_def *zero = nir_imm_zero(b, 4, 32);
+      nir_pop_if(b, NULL);
+      rgba = nir_if_phi(b, rgba, zero);
+   }
+   return rgba;
+}
+
+nir_def *
+zink_vertex_index_load(nir_builder *b, const struct zink_vertex_inputs *inputs, nir_def *offset)
+{
+   unsigned buffer = inputs->index_slot - inputs->first_binding;
+   nir_def *word = load_word(b, inputs, buffer, inputs->first_binding, nir_iand_imm(b, offset, ~3u));
+   nir_def *value = nir_ushr(b, word, nir_imul_imm(b, nir_iand_imm(b, offset, 3), 8));
+   return nir_iand_imm(b, value, inputs->index_size == 4 ? UINT32_MAX :
+                       (1u << (8 * inputs->index_size)) - 1);
 }
 
 void

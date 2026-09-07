@@ -8,7 +8,10 @@ struct zink_vertex_inputs {
    struct pipe_vertex_element elements[PIPE_MAX_ATTRIBS];
    unsigned slots[PIPE_MAX_ATTRIBS];
    unsigned offsets[PIPE_MAX_ATTRIBS];
+   unsigned max_records[PIPE_MAX_ATTRIBS];
    struct pipe_shader_buffer buffers[ZINK_VERTEX_INPUT_BUFFERS];
+   unsigned index_size, index_slot, restart_index;
+   bool primitive_restart;
    unsigned first_binding;
    unsigned count;
    unsigned source_count;
@@ -22,5 +25,7 @@ bool zink_vertex_inputs_prepare(struct zink_context *ctx, const nir_shader *nir,
                                struct zink_vertex_inputs *inputs);
 nir_def *zink_vertex_input_load(nir_builder *b, const struct zink_vertex_inputs *inputs,
                                 unsigned index, nir_def *record);
+nir_def *zink_vertex_index_load(nir_builder *b, const struct zink_vertex_inputs *inputs,
+                                 nir_def *offset);
 void zink_vertex_inputs_finish(struct pipe_context *pctx, struct zink_vertex_inputs *inputs);
 #endif

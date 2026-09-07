@@ -77,6 +77,17 @@ parameter(nir_builder *b, unsigned index)
 }
 
 static nir_def *
+source_vertex(nir_builder *b, const struct zink_vertex_inputs *inputs)
+{
+   nir_def *id = nir_channel(b, nir_load_global_invocation_id(b, 32), 0);
+   if (inputs->index_size) {
+      nir_def *offset = nir_iadd(b, parameter(b, 7), nir_imul_imm(b, id, inputs->index_size));
+      return nir_iadd(b, zink_vertex_index_load(b, inputs, offset), parameter(b, 5));
+   }
+   return nir_iadd(b, id, parameter(b, 1));
+}
+
+static nir_def *
 record_offset(nir_builder *b, bool compute)
 {
    nir_def *vertex, *instance;
@@ -119,15 +130,15 @@ lower_to_compute(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *value = NULL;
+   const struct zink_vertex_inputs *inputs = data;
    switch (intr->intrinsic) {
    case nir_intrinsic_load_input: {
-      const struct zink_vertex_inputs *inputs = data;
       unsigned index = nir_intrinsic_base(intr);
       const struct pipe_vertex_element *elem = &inputs->elements[index];
       nir_def *id = nir_load_global_invocation_id(b, 32);
       nir_def *record = elem->instance_divisor ?
          nir_iadd(b, parameter(b, 3), nir_udiv_imm(b, nir_channel(b, id, 1), elem->instance_divisor)) :
-         nir_iadd(b, parameter(b, 1), nir_channel(b, id, 0));
+         source_vertex(b, inputs);
       nir_def *rgba = zink_vertex_input_load(b, inputs, index, record);
       unsigned channels[4];
       for (unsigned c = 0; c < intr->num_components; c++)
@@ -136,16 +147,16 @@ lower_to_compute(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       break;
    }
    case nir_intrinsic_load_vertex_id:
-      value = nir_iadd(b, nir_channel(b, nir_load_global_invocation_id(b, 32), 0), parameter(b, 1));
+      value = source_vertex(b, inputs);
       break;
    case nir_intrinsic_load_instance_id:
       value = nir_channel(b, nir_load_global_invocation_id(b, 32), 1);
       break;
    case nir_intrinsic_load_base_vertex:
-      value = nir_imm_int(b, 0); /* Only non-indexed draws enter this path. */
+      value = parameter(b, 5);
       break;
    case nir_intrinsic_load_first_vertex:
-      value = parameter(b, 1);
+      value = parameter(b, inputs->index_size ? 5 : 1);
       break;
    case nir_intrinsic_load_base_instance:
       value = parameter(b, 3);
@@ -225,6 +236,27 @@ make_shaders(const nir_shader *source, struct zink_vertex_inputs *inputs,
    cs->info.first_ubo_is_default_ubo = true;
    cs->info.num_ssbos = PREPASS_SSBO + 1;
    NIR_PASS(_, cs, nir_shader_intrinsics_pass, lower_to_compute, nir_metadata_control_flow, inputs);
+   if (inputs->index_size) {
+      nir_builder b = nir_builder_create(nir_shader_get_entrypoint(cs));
+      b.cursor = nir_before_impl(b.impl);
+      nir_def *id = nir_load_global_invocation_id(&b, 32);
+      nir_def *vertex = nir_channel(&b, id, 0);
+      nir_def *offset = nir_iadd(&b, parameter(&b, 7), nir_imul_imm(&b, vertex, inputs->index_size));
+      nir_def *index = zink_vertex_index_load(&b, inputs, offset);
+      nir_def *restart = inputs->primitive_restart ?
+         nir_ieq_imm(&b, index, inputs->restart_index) : nir_imm_false(&b);
+      nir_push_if(&b, nir_ieq_imm(&b, nir_channel(&b, id, 1), 0));
+      nir_store_ssbo(&b, nir_bcsel(&b, restart, nir_imm_int(&b, UINT32_MAX), vertex),
+                     nir_imm_int(&b, PREPASS_SSBO),
+                     nir_iadd(&b, parameter(&b, 6), nir_imul_imm(&b, vertex, 4)),
+                     .write_mask = 1, .align_mul = 4);
+      nir_pop_if(&b, NULL);
+      nir_push_if(&b, restart);
+      nir_jump(&b, nir_jump_return);
+      nir_pop_if(&b, NULL);
+      nir_progress(true, b.impl, nir_metadata_none);
+      NIR_PASS(_, cs, nir_lower_returns);
+   }
    nir_foreach_variable_with_modes_safe(var, cs, nir_var_shader_out | nir_var_shader_in)
       exec_node_remove(&var->node);
    cs->info.outputs_written = cs->info.outputs_read = 0;
@@ -256,7 +288,7 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
    struct zink_screen *screen = zink_screen(pctx->screen);
    struct zink_shader *vs = ctx->gfx_stages[MESA_SHADER_VERTEX];
    if (ctx->vertex_prepass_active || !vs || !vs->vertex_prepass_nir ||
-       indirect || info->index_size || num_draws != 1 || !draws[0].count || !info->instance_count ||
+       indirect || num_draws != 1 || !draws[0].count || !info->instance_count ||
        ctx->gfx_stages[MESA_SHADER_TESS_CTRL] || ctx->gfx_stages[MESA_SHADER_TESS_EVAL] ||
        ctx->gfx_stages[MESA_SHADER_GEOMETRY] || ctx->num_so_targets || ctx->render_condition_active ||
        (ctx->bs && ctx->bs->active_queries.entries) || !list_is_empty(&ctx->suspended_queries) ||
@@ -268,12 +300,13 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
    struct zink_vertex_inputs inputs = {0};
    if (!zink_vertex_inputs_prepare(ctx, vs->vertex_prepass_nir, info, draws, &inputs))
       return false;
-   uint64_t size = (uint64_t)draws[0].count * info->instance_count * PREPASS_STRIDE;
+   uint64_t vertex_size = (uint64_t)draws[0].count * info->instance_count * PREPASS_STRIDE;
+   uint64_t size = vertex_size + (info->index_size ? (uint64_t)draws[0].count * 4 : 0);
    if (size > UINT32_MAX || size > screen->info.props.limits.maxStorageBufferRange) {
       zink_vertex_inputs_finish(pctx, &inputs);
       return false;
    }
-   struct pipe_resource *output = pipe_buffer_create(pctx->screen, PIPE_BIND_SHADER_BUFFER,
+   struct pipe_resource *output = pipe_buffer_create(pctx->screen, PIPE_BIND_SHADER_BUFFER | PIPE_BIND_INDEX_BUFFER,
                                                      PIPE_USAGE_DEFAULT, size);
    if (!output) {
       zink_vertex_inputs_finish(pctx, &inputs);
@@ -323,7 +356,10 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
    struct pipe_constant_buffer saved_vs_ubo = ctx->ubos[MESA_SHADER_VERTEX][PREPASS_UBO];
    struct pipe_shader_buffer saved_vs_ssbo = ctx->ssbos[MESA_SHADER_VERTEX][PREPASS_SSBO];
    unsigned saved_vs_writable = (ctx->writable_ssbos[MESA_SHADER_VERTEX] >> PREPASS_SSBO) & 1;
-   uint32_t params[8] = {draws[0].count, draws[0].start, info->instance_count, info->start_instance, drawid_offset};
+   uint32_t params[8] = {draws[0].count, info->index_size ? 0 : draws[0].start,
+                         info->instance_count, info->start_instance, drawid_offset,
+                         info->index_size ? draws[0].index_bias : 0, vertex_size,
+                         draws[0].start * info->index_size};
    struct pipe_constant_buffer parameters = {.user_buffer = params, .buffer_size = sizeof(params)};
    struct pipe_shader_buffer generated = {.buffer = output, .buffer_size = size};
    for (unsigned i = 0; i < PREPASS_UBO; i++)
@@ -339,11 +375,25 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
    struct pipe_grid_info grid = {.work_dim = 2, .block = {1, 1, 1},
                                 .grid = {draws[0].count, info->instance_count, 1}};
    pctx->launch_grid(pctx, &grid);
-   pctx->memory_barrier(pctx, PIPE_BARRIER_SHADER_BUFFER);
+   pctx->memory_barrier(pctx, PIPE_BARRIER_SHADER_BUFFER | PIPE_BARRIER_INDEX_BUFFER);
    pctx->set_constant_buffer(pctx, MESA_SHADER_VERTEX, PREPASS_UBO, &parameters);
    pctx->set_shader_buffers(pctx, MESA_SHADER_VERTEX, PREPASS_SSBO, 1, &generated, 0);
    pctx->bind_vs_state(pctx, replay_cso);
-   pctx->draw_vbo(pctx, info, drawid_offset, NULL, draws, 1);
+   struct pipe_draw_info replay_info = *info;
+   struct pipe_draw_start_count_bias replay_draw = *draws;
+   if (info->index_size) {
+      replay_info.index_size = 4;
+      replay_info.has_user_indices = false;
+      replay_info.index.resource = output;
+      replay_info.restart_index = UINT32_MAX;
+      replay_info.index_bounds_valid = true;
+      replay_info.min_index = 0;
+      replay_info.max_index = draws[0].count - 1;
+      replay_info.index_bias_varies = false;
+      replay_draw.start = vertex_size / 4;
+      replay_draw.index_bias = 0;
+   }
+   pctx->draw_vbo(pctx, &replay_info, drawid_offset, NULL, &replay_draw, 1);
    pctx->bind_vs_state(pctx, vs);
    bind_ubo(pctx, MESA_SHADER_VERTEX, PREPASS_UBO, &saved_vs_ubo);
    pctx->set_shader_buffers(pctx, MESA_SHADER_VERTEX, PREPASS_SSBO, 1, &saved_vs_ssbo, saved_vs_writable);
@@ -363,6 +413,8 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
    zink_vertex_inputs_finish(pctx, &inputs);
    pipe_resource_release(pctx, output);
    ctx->vertex_prepass_active = false;
-   mesa_logi("ZINK_VERTEX_PREPASS draw vertices=%u instances=%u inputs=%u", draws[0].count, info->instance_count, inputs.count);
+   mesa_logi("ZINK_VERTEX_PREPASS draw vertices=%u instances=%u inputs=%u index_size=%u restart=%u restart_index=%u",
+             draws[0].count, info->instance_count, inputs.count, (unsigned)info->index_size,
+             (unsigned)info->primitive_restart, info->restart_index);
    return true;
 }
