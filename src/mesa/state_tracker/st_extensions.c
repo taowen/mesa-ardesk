@@ -41,6 +41,7 @@
 #include "tgsi/tgsi_from_mesa.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
+#include "util/u_vbuf.h"
 
 #include "st_context.h"
 #include "st_debug.h"
@@ -683,13 +684,21 @@ init_format_extensions(struct pipe_screen *screen,
    int j;
    int num_formats = ARRAY_SIZE(mapping->format);
    int num_ext = ARRAY_SIZE(mapping->extension_offset);
+   struct u_vbuf_caps vertex_caps;
+   bool vertex = target == PIPE_BUFFER && bind_flags == PIPE_BIND_VERTEX_BUFFER;
+   if (vertex)
+      u_vbuf_get_caps(screen, &vertex_caps, false);
 
    for (i = 0; i < num_mappings; i++) {
       int num_supported = 0;
 
       /* Examine each format in the list. */
       for (j = 0; j < num_formats && mapping[i].format[j]; j++) {
-         if (screen->is_format_supported(screen, mapping[i].format[j],
+         /* CSO uses the same u_vbuf translation when vertex fetch needs a
+          * CPU fallback. Require the actual translated destination format. */
+         enum pipe_format format = vertex ?
+            vertex_caps.format_translation[mapping[i].format[j]] : mapping[i].format[j];
+         if (screen->is_format_supported(screen, format,
                                          target, 0, 0, bind_flags)) {
             num_supported++;
          }
