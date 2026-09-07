@@ -13,7 +13,7 @@ zink_vertex_inputs_prepare(struct zink_context *ctx, const nir_shader *nir,
                const struct pipe_draw_start_count_bias *draw,
                struct zink_vertex_inputs *inputs)
 {
-   inputs->first_binding = nir->info.num_ssbos;
+   inputs->first_binding = 0;
    inputs->index_size = info->index_size;
    inputs->primitive_restart = info->primitive_restart;
    inputs->restart_index = info->restart_index;
@@ -63,7 +63,7 @@ zink_vertex_inputs_prepare(struct zink_context *ctx, const nir_shader *nir,
             while (buffer < inputs->count &&
                    inputs->buffers[buffer].buffer != vb->buffer.resource)
                buffer++;
-            unsigned slot = nir->info.num_ssbos + buffer;
+            unsigned slot = buffer;
             if (slot >= ZINK_VERTEX_INPUT_BUFFERS)
                return false;
             inputs->elements[index] = *elem;
@@ -90,9 +90,9 @@ zink_vertex_inputs_prepare(struct zink_context *ctx, const nir_shader *nir,
       unsigned buffer = 0;
       while (buffer < inputs->count && inputs->buffers[buffer].buffer != index)
          buffer++;
-      if (nir->info.num_ssbos + buffer >= ZINK_VERTEX_INPUT_BUFFERS)
+      if (buffer >= ZINK_VERTEX_INPUT_BUFFERS)
          return false;
-      inputs->index_slot = nir->info.num_ssbos + buffer;
+      inputs->index_slot = buffer;
       if (buffer == inputs->count)
          inputs->buffers[inputs->count++] = (struct pipe_shader_buffer) {
             .buffer = index, .buffer_size = index->width0,
@@ -107,9 +107,32 @@ zink_vertex_inputs_prepare(struct zink_context *ctx, const nir_shader *nir,
          tail_size += 4;
       }
    }
+   unsigned total = inputs->count + (tail_size != 0);
+   if (total > ZINK_VERTEX_INPUT_BUFFERS)
+      return false;
+   struct pipe_screen *pscreen = ctx->base.screen;
+   struct zink_screen *screen = zink_screen(pscreen);
+   inputs->texture_binding = MAX2(nir->info.num_textures, ctx->di.num_sampler_views[MESA_SHADER_VERTEX]);
+   inputs->first_binding = nir->info.num_ssbos;
+   unsigned texture_limit = pscreen->shader_caps[MESA_SHADER_COMPUTE].max_sampler_views;
+   bool texel_format = pscreen->is_format_supported(pscreen, PIPE_FORMAT_R32_UINT,
+                                                   PIPE_BUFFER, 0, 0, PIPE_BIND_SAMPLER_VIEW);
+   for (unsigned i = 0; i < total; i++) {
+      unsigned bytes = i < inputs->source_count ? inputs->buffers[i].buffer_size : tail_size;
+      if (texel_format && inputs->texture_binding + inputs->texel_count < texture_limit &&
+          bytes / 4 <= screen->info.props.limits.maxTexelBufferElements) {
+         inputs->texel_mask |= BITFIELD_BIT(i);
+         inputs->bindings[i] = inputs->texture_binding + inputs->texel_count++;
+      } else {
+         inputs->bindings[i] = inputs->first_binding + inputs->ssbo_count++;
+      }
+   }
+   if (inputs->first_binding + inputs->ssbo_count > ZINK_VERTEX_OUTPUT_SLOT)
+      return false;
+   for (unsigned i = 0; i < PIPE_MAX_ATTRIBS; i++)
+      inputs->slots[i] += inputs->first_binding;
+   inputs->index_slot += inputs->first_binding;
    if (tail_size) {
-      if (nir->info.num_ssbos + inputs->count >= ZINK_VERTEX_INPUT_BUFFERS)
-         return false;
       struct pipe_context *pctx = &ctx->base;
       inputs->tail = pipe_buffer_create(pctx->screen, PIPE_BIND_SHADER_BUFFER,
                                         PIPE_USAGE_DEFAULT, tail_size);
@@ -130,7 +153,56 @@ zink_vertex_inputs_prepare(struct zink_context *ctx, const nir_shader *nir,
          .buffer = inputs->tail, .buffer_size = tail_size,
       };
    }
+   for (unsigned i = 0; i < inputs->count; i++) {
+      if (inputs->texel_mask & BITFIELD_BIT(i)) {
+         struct pipe_resource *resource = inputs->buffers[i].buffer;
+         unsigned bytes = inputs->buffers[i].buffer_size & ~3u;
+         /* A sub-word source is fetched only through its padded tail. Give its
+          * unused descriptor a valid view as well. */
+         if (!bytes) {
+            resource = inputs->tail;
+            bytes = resource->width0;
+         }
+         struct pipe_sampler_view view = {
+            .format = PIPE_FORMAT_R32_UINT, .target = PIPE_BUFFER,
+            .swizzle_r = PIPE_SWIZZLE_X, .swizzle_g = PIPE_SWIZZLE_0,
+            .swizzle_b = PIPE_SWIZZLE_0, .swizzle_a = PIPE_SWIZZLE_1,
+            .u.buf = {.offset = 0, .size = bytes},
+         };
+         unsigned slot = inputs->bindings[i] - inputs->texture_binding;
+         inputs->views[slot] = ctx->base.create_sampler_view(&ctx->base, resource, &view);
+         if (!inputs->views[slot]) {
+            zink_vertex_inputs_finish(&ctx->base, inputs);
+            return false;
+         }
+      } else {
+         inputs->ssbo_buffers[inputs->bindings[i] - inputs->first_binding] = inputs->buffers[i];
+      }
+   }
    return true;
+}
+
+static nir_def *
+fetch_word(nir_builder *b, const struct zink_vertex_inputs *inputs, unsigned binding, nir_def *offset)
+{
+   unsigned buffer = binding - inputs->first_binding;
+   unsigned slot = inputs->bindings[buffer];
+   if (!(inputs->texel_mask & BITFIELD_BIT(buffer)))
+      return nir_load_ssbo(b, 1, 32, nir_imm_int(b, slot), offset,
+                           .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+   nir_tex_instr *tex = nir_tex_instr_create(b->shader, 2);
+   tex->op = nir_texop_txf;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_BUF;
+   tex->coord_components = 1;
+   tex->dest_type = nir_type_uint32;
+   tex->texture_index = slot;
+   tex->sampler_index = slot;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, nir_ushr_imm(b, offset, 2));
+   tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_texture_deref,
+      &nir_build_deref_var(b, inputs->variables[buffer])->def);
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(b, &tex->instr);
+   return nir_channel(b, &tex->def, 0);
 }
 
 static nir_def *
@@ -140,14 +212,11 @@ load_word(nir_builder *b, const struct zink_vertex_inputs *inputs,
    nir_def *tail_word = NULL;
    if (inputs->tail_offsets[buffer] != UINT32_MAX) {
       nir_push_if(b, nir_ieq_imm(b, offset, inputs->buffers[buffer].buffer_size & ~3u));
-      tail_word = nir_load_ssbo(b, 1, 32,
-                               nir_imm_int(b, first_binding + inputs->source_count),
-                               nir_imm_int(b, inputs->tail_offsets[buffer]),
-                               .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+      tail_word = fetch_word(b, inputs, first_binding + inputs->source_count,
+                             nir_imm_int(b, inputs->tail_offsets[buffer]));
       nir_push_else(b, NULL);
    }
-   nir_def *word = nir_load_ssbo(b, 1, 32, nir_imm_int(b, first_binding + buffer), offset,
-                                .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+   nir_def *word = fetch_word(b, inputs, first_binding + buffer, offset);
    if (tail_word) {
       nir_pop_if(b, NULL);
       word = nir_if_phi(b, tail_word, word);
@@ -203,6 +272,8 @@ zink_vertex_index_load(nir_builder *b, const struct zink_vertex_inputs *inputs, 
 void
 zink_vertex_inputs_finish(struct pipe_context *pctx, struct zink_vertex_inputs *inputs)
 {
+   for (unsigned i = 0; i < inputs->texel_count; i++)
+      pipe_sampler_view_reference(&inputs->views[i], NULL);
    if (inputs->tail)
       pipe_resource_release(pctx, inputs->tail);
 }

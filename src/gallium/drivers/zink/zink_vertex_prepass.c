@@ -9,7 +9,7 @@
 /* Development path, deliberately not used to raise GL/Vulkan capabilities.
  * Reserved bindings are checked before any application shader is converted. */
 #define PREPASS_UBO 15
-#define PREPASS_SSBO ZINK_VERTEX_INPUT_BUFFERS
+#define PREPASS_SSBO ZINK_VERTEX_OUTPUT_SLOT
 #define PREPASS_STRIDE (VARYING_SLOT_MAX * 16)
 
 static bool
@@ -235,6 +235,20 @@ make_shaders(const nir_shader *source, struct zink_vertex_inputs *inputs,
    cs->info.num_ubos = PREPASS_UBO + 1;
    cs->info.first_ubo_is_default_ubo = true;
    cs->info.num_ssbos = PREPASS_SSBO + 1;
+   for (unsigned i = 0; i < inputs->count; i++) {
+      unsigned binding = inputs->bindings[i];
+      if (inputs->texel_mask & BITFIELD_BIT(i)) {
+         const struct glsl_type *type = glsl_sampler_type(GLSL_SAMPLER_DIM_BUF, false, false, GLSL_TYPE_UINT);
+         nir_variable *var = nir_variable_create(cs, nir_var_uniform, type, "vertex_input_words");
+         inputs->variables[i] = var;
+         var->data.binding = var->data.driver_location = binding;
+         BITSET_SET(cs->info.texture_buffers, binding);
+      } else {
+         add_buffer(cs, nir_var_mem_ssbo, binding, true);
+      }
+   }
+   if (inputs->texel_count)
+      cs->info.num_textures = inputs->texture_binding + inputs->texel_count;
    NIR_PASS(_, cs, nir_shader_intrinsics_pass, lower_to_compute, nir_metadata_control_flow, inputs);
    if (inputs->index_size) {
       nir_builder b = nir_builder_create(nir_shader_get_entrypoint(cs));
@@ -262,8 +276,6 @@ make_shaders(const nir_shader *source, struct zink_vertex_inputs *inputs,
    cs->info.outputs_written = cs->info.outputs_read = 0;
    cs->num_outputs = cs->num_inputs = 0;
    cs->info.inputs_read = 0;
-   for (unsigned i = 0; i < inputs->count; i++)
-      add_buffer(cs, nir_var_mem_ssbo, source->info.num_ssbos + i, true);
    add_buffer(cs, nir_var_mem_ubo, PREPASS_UBO, true);
    add_buffer(cs, nir_var_mem_ssbo, PREPASS_SSBO, false);
    nir_shader_gather_info(cs, nir_shader_get_entrypoint(cs));
@@ -340,9 +352,16 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
       pipe_sampler_view_reference(&saved_views[i], ctx->sampler_views[MESA_SHADER_COMPUTE][i]);
       saved_samplers[i] = ctx->sampler_states[MESA_SHADER_COMPUTE][i];
    }
-   pctx->set_sampler_views(pctx, MESA_SHADER_COMPUTE, 0, vertex_view_count,
-                          saved_view_count > vertex_view_count ? saved_view_count - vertex_view_count : 0,
-                          ctx->sampler_views[MESA_SHADER_VERTEX]);
+   struct pipe_sampler_view *compute_views[PIPE_MAX_SAMPLERS] = {0};
+   memcpy(compute_views, ctx->sampler_views[MESA_SHADER_VERTEX], vertex_view_count * sizeof(compute_views[0]));
+   unsigned compute_view_count = vertex_view_count;
+   if (inputs.texel_count) {
+      memcpy(compute_views + inputs.texture_binding, inputs.views, inputs.texel_count * sizeof(compute_views[0]));
+      compute_view_count = inputs.texture_binding + inputs.texel_count;
+   }
+   pctx->set_sampler_views(pctx, MESA_SHADER_COMPUTE, 0, compute_view_count,
+                          saved_view_count > compute_view_count ? saved_view_count - compute_view_count : 0,
+                          compute_views);
    void *vertex_samplers[PIPE_MAX_SAMPLERS] = {0};
    for (unsigned i = 0; i < vertex_sampler_count; i++)
       vertex_samplers[i] = ctx->sampler_states[MESA_SHADER_VERTEX][i];
@@ -367,9 +386,9 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
    pctx->set_constant_buffer(pctx, MESA_SHADER_COMPUTE, PREPASS_UBO, &parameters);
    pctx->set_shader_buffers(pctx, MESA_SHADER_COMPUTE, 0, PREPASS_SSBO,
                            ctx->ssbos[MESA_SHADER_VERTEX], ctx->writable_ssbos[MESA_SHADER_VERTEX]);
-   if (inputs.count)
-      pctx->set_shader_buffers(pctx, MESA_SHADER_COMPUTE, vs->vertex_prepass_nir->info.num_ssbos,
-                              inputs.count, inputs.buffers, 0);
+   if (inputs.ssbo_count)
+      pctx->set_shader_buffers(pctx, MESA_SHADER_COMPUTE, inputs.first_binding,
+                              inputs.ssbo_count, inputs.ssbo_buffers, 0);
    pctx->set_shader_buffers(pctx, MESA_SHADER_COMPUTE, PREPASS_SSBO, 1, &generated, 1);
    pctx->bind_compute_state(pctx, compute_cso);
    struct pipe_grid_info grid = {.work_dim = 2, .block = {1, 1, 1},
@@ -402,7 +421,7 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
       bind_ubo(pctx, MESA_SHADER_COMPUTE, i, &saved_ubos[i]);
    pctx->set_shader_buffers(pctx, MESA_SHADER_COMPUTE, 0, PREPASS_SSBO + 1, saved_ssbos, saved_writable);
    pctx->set_sampler_views(pctx, MESA_SHADER_COMPUTE, 0, saved_view_count,
-                          vertex_view_count > saved_view_count ? vertex_view_count - saved_view_count : 0,
+                          compute_view_count > saved_view_count ? compute_view_count - saved_view_count : 0,
                           saved_views);
    pctx->bind_sampler_states(pctx, MESA_SHADER_COMPUTE, 0, sampler_count, saved_samplers);
    ctx->di.num_samplers[MESA_SHADER_COMPUTE] = saved_sampler_count;
@@ -413,8 +432,9 @@ zink_vertex_prepass_draw(struct pipe_context *pctx, const struct pipe_draw_info 
    zink_vertex_inputs_finish(pctx, &inputs);
    pipe_resource_release(pctx, output);
    ctx->vertex_prepass_active = false;
-   mesa_logi("ZINK_VERTEX_PREPASS draw vertices=%u instances=%u inputs=%u index_size=%u restart=%u restart_index=%u",
+   mesa_logi("ZINK_VERTEX_PREPASS draw vertices=%u instances=%u inputs=%u index_size=%u restart=%u restart_index=%u input_binding=%s input_texels=%u input_ssbos=%u",
              draws[0].count, info->instance_count, inputs.count, (unsigned)info->index_size,
-             (unsigned)info->primitive_restart, info->restart_index);
+             (unsigned)info->primitive_restart, info->restart_index, inputs.texel_count ? (inputs.ssbo_count ? "mixed" : "texel") : "ssbo",
+             inputs.texel_count, inputs.ssbo_count);
    return true;
 }
