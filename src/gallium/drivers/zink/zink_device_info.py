@@ -594,11 +594,19 @@ zink_get_physical_device_info(struct zink_screen *screen)
       screen->vk.GetPhysicalDeviceFeatures(screen->pdev, &info->feats.features);
    }
 
+   // Unlike the feature structure, the KHR divisor properties are not an
+   // alias of EXT: they have a new sType and an additional field.
+   VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR vdiv_khr_props = {0};
    // check for device properties
    bool copy_layered_props = false;
    if (screen->vk.GetPhysicalDeviceProperties2) {
       VkPhysicalDeviceProperties2 props = {0};
       props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+      if (support_KHR_vertex_attribute_divisor && !info->have_vulkan14) {
+         vdiv_khr_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR;
+         vdiv_khr_props.pNext = props.pNext;
+         props.pNext = &vdiv_khr_props;
+      }
 
 %for version in versions:
    %if version.device_version < (1,2,0):
@@ -617,7 +625,7 @@ zink_get_physical_device_info(struct zink_screen *screen)
    %if ext.has_properties:
       <%helpers:guard ext="${ext}">
          %if ext.properties_promoted:
-               if (support_${ext.name_with_vendor()} && !info->have_vulkan${ext.core_since.struct()}) {
+               if (support_${ext.name_with_vendor()} && !info->have_vulkan${ext.core_since.struct()}${" && !support_KHR_vertex_attribute_divisor" if ext.name == "VK_EXT_vertex_attribute_divisor" else ""}) {
          %else:
                if (support_${ext.name_with_vendor()}) {
          %endif
@@ -662,6 +670,8 @@ zink_get_physical_device_info(struct zink_screen *screen)
 
       // note: setting up local VkPhysicalDeviceProperties2.
       screen->vk.GetPhysicalDeviceProperties2(screen->pdev, &props);
+      if (support_KHR_vertex_attribute_divisor && !info->have_vulkan14)
+         info->vdiv_props.maxVertexAttribDivisor = vdiv_khr_props.maxVertexAttribDivisor;
 
       if (support_KHR_maintenance7 && layered_props_list.layeredApiCount) {
         info->vk_layered_props = vk_layered_props.properties.properties;
