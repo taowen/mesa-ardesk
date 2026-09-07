@@ -326,6 +326,9 @@ struct zink_vertex_elements_hw_state {
 };
 
 struct zink_vertex_elements_state {
+   /* Gallium layout before Vulkan attribute decomposition, for input pulling. */
+   unsigned num_elements;
+   struct pipe_vertex_element elements[PIPE_MAX_ATTRIBS];
    /* decomposed attributes read only a single component for format compatibility */
    bool has_decomposed_attrs;
    struct {
